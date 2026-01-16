@@ -1,0 +1,683 @@
+import argparse
+import datetime
+import logging
+import math
+import os
+import random
+import time
+from copy import deepcopy
+
+import numpy as np
+import scipy.io as sio
+import matplotlib
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda import amp
+
+from sklearn import preprocessing
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, cohen_kappa_score
+from sklearn.decomposition import PCA
+from skimage.segmentation import slic
+
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.utils import add_self_loops, get_laplacian, dense_to_sparse
+
+# ==============================================================================
+# Logger & Utils
+# ==============================================================================
+def seed_everything(seed=3407):
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+seed_everything(3407)
+
+def setup_logger(output_dir: str):
+    os.makedirs(os.path.join(output_dir, "log"), exist_ok=True)
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(output_dir, "log", f"log_run_{run_id}.txt")
+    logger = logging.getLogger(f"GCNAS-Final-{run_id}")
+    logger.setLevel(logging.INFO)
+    def beijing(sec, what): return datetime.datetime.now().timetuple()
+    logging.Formatter.converter = beijing
+    formatter = logging.Formatter("%(asctime)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(formatter); logger.addHandler(fh)
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter); logger.addHandler(ch)
+    return logger, run_id
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+class TimeTracker:
+    def __init__(self):
+        self.phases = {}
+    def start(self, phase): self.phases[phase] = {"start": time.time(), "end": None}
+    def stop(self, phase): 
+        if phase in self.phases: self.phases[phase]["end"] = time.time()
+    def get_duration(self, phase):
+        if phase in self.phases and self.phases[phase]["end"]:
+            return self.phases[phase]["end"] - self.phases[phase]["start"]
+        return 0.0
+
+tracker = TimeTracker()
+
+# ==============================================================================
+# Mamba Imports
+# ==============================================================================
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    from mamba_ssm.modules.mamba_simple import Mamba
+try:
+    from mamba_ssm.ops.triton.layernorm import RMSNorm
+except Exception:
+    RMSNorm = nn.LayerNorm
+
+# ==============================================================================
+# Data Utils
+# ==============================================================================
+def SegmentsLabelProcess(line, sample, labels):
+    labels = np.array(labels, np.int64)
+    ls = list(set(np.reshape(labels, [-1]).tolist()))
+    dic = {ls[i]: i for i in range(len(ls))}
+    new_labels = labels
+    for i in range(line):
+        for j in range(sample):
+            new_labels[i, j] = dic[new_labels[i, j]]
+    return new_labels
+
+class SegmentMap(object):
+    def __init__(self, data_in, Unet_depth=3):
+        self.line, self.sample, self.band = data_in.shape
+        data = np.reshape(data_in, [self.line * self.sample, self.band])
+        self.data = np.reshape(preprocessing.StandardScaler().fit_transform(data), [self.line, self.sample, self.band])
+        self.Unet_depth = Unet_depth
+
+    def getHierarchy(self):
+        h, w = self.line, self.sample
+        n_s = 256
+        n_segments = []
+        for _ in range(self.Unet_depth):
+            n_segments.append(n_s); n_s = n_s * 2
+
+        segs = []
+        for i in range(self.Unet_depth):
+            segment = slic(self.data, n_segments=n_segments[-i - 1], compactness=1, max_num_iter=20, sigma=1,
+                           convert2lab=False, enforce_connectivity=False, start_label=1, min_size_factor=0.1, max_size_factor=2, slic_zero=False)
+            if segment.max() + 1 != len(np.unique(segment)): segment = SegmentsLabelProcess(h, w, segment)
+            segs.append(segment)
+
+        A_list = []
+        for l in range(len(segs)):
+            map_ = np.reshape(segs[l], [h, w])
+            count = int(np.max(segs[l])) + 1
+            A = torch.zeros([count, count], dtype=torch.int16)
+            right = np.vstack([map_[:, :-1].ravel(), map_[:, 1:].ravel()]).T
+            down = np.vstack([map_[:-1, :].ravel(), map_[1:, :].ravel()]).T
+            edges = np.vstack([right[right[:, 0] != right[:, 1]], down[down[:, 0] != down[:, 1]]])
+            if len(edges) > 0:
+                for u, v in edges: A[u, v] = A[v, u] = 1
+            A_list.append(A)
+
+        segs = np.concatenate([np.reshape([i for i in range(h * w)], [1, h, w]), segs], axis=0)
+        H_list = []
+        # Full Hierarchy logic preserved
+        H_list_full = []
+        # Level 0->1
+        S = np.zeros([np.max(segs[0]) + 1, np.max(segs[1]) + 1], dtype=np.float32)
+        l1, l2 = np.reshape(segs[0], [-1]), np.reshape(segs[1], [-1])
+        coords = np.stack([l1, l2]); coords = np.unique(coords, axis=1)
+        S[coords[0], coords[1]] = 1
+        H_list_full.append(S)
+        
+        for i in range(self.Unet_depth - 1):
+            for j in range(self.Unet_depth - 1 - i):
+                S = np.zeros([np.max(segs[i + 1]) + 1, np.max(segs[i + j + 2]) + 1], dtype=np.float32)
+                l1, l2 = np.reshape(segs[i + 1], [-1]), np.reshape(segs[i + j + 2], [-1])
+                coords = np.stack([l1, l2]); coords = np.unique(coords, axis=1)
+                S[coords[0], coords[1]] = 1
+                H_list_full.append(S)
+        
+        return segs, A_list, H_list_full
+
+def sampling_fixed(proportion_train, proportion_val, groundtruth):
+    classnum = int(max(groundtruth))
+    train_gt, train_gt_s, val_gt, test_gt, Y_u = [np.zeros_like(groundtruth) for _ in range(5)]
+    for i in range(classnum):
+        indexes = [j for j, x in enumerate(groundtruth.ravel().tolist()) if x == i + 1]
+        np.random.shuffle(indexes)
+        if proportion_train < 1:
+            n_train = max(int(proportion_train * len(indexes)), 2)
+            n_val = max(int(proportion_val * len(indexes)), 2)
+        else:
+            limit = len(indexes)
+            n_train = int(min(proportion_train, limit * 0.5))
+            n_val = int(min(proportion_val, limit * 0.5))
+            n_train = max(n_train, 2); n_val = max(n_val, 2)
+        
+        train_gt[indexes[:n_train]] = groundtruth[indexes[:n_train]]
+        val_gt[indexes[n_train*2 : n_train*2+n_val]] = groundtruth[indexes[n_train*2 : n_train*2+n_val]]
+        test_gt[indexes[n_train*2+n_val:]] = groundtruth[indexes[n_train*2+n_val:]]
+
+    return train_gt, train_gt_s, val_gt, test_gt, Y_u
+
+def get_label_mask(line, sample, class_num, samples):
+    mask = np.zeros((line * sample,), dtype=np.bool_)
+    mask[samples != 0] = True
+    return mask
+
+class ClassBalancedFocalLoss(nn.Module):
+    def __init__(self, num_classes: int, gamma: float = 2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma; self.register_buffer("alpha", alpha)
+    @staticmethod
+    def from_labels(num_classes: int, labels: np.ndarray, gamma: float = 2.0, device=None):
+        counts = np.zeros((num_classes,), dtype=np.float64)
+        for c in range(1, num_classes + 1): counts[c - 1] = np.sum(labels == c)
+        inv = 1.0 / np.maximum(counts, 1.0)
+        alpha = inv / inv.mean()
+        return ClassBalancedFocalLoss(num_classes=num_classes, gamma=gamma, alpha=torch.tensor(alpha, dtype=torch.float32, device=device))
+    def forward(self, logits, targets, mask):
+        if mask.sum() == 0: return logits.sum() * 0.0
+        logits_m, targets_m = logits[mask], targets[mask]
+        logp = F.log_softmax(logits_m, dim=-1); p = torch.exp(logp)
+        logpt = logp.gather(1, targets_m.view(-1, 1)).squeeze(1)
+        pt = p.gather(1, targets_m.view(-1, 1)).squeeze(1)
+        alpha_t = self.alpha.gather(0, targets_m)
+        loss = -alpha_t * (1.0 - pt).pow(self.gamma) * logpt
+        return loss.mean()
+
+# ==============================================================================
+# Model Modules ###################################################################
+# ==============================================================================
+class AdvancedPixelScanMamba(nn.Module):
+    def __init__(self, d_model, d_state=16, expand=2):
+        super().__init__()
+        self.directions = nn.ModuleList([Mamba(d_model=d_model, d_state=d_state, expand=expand) for _ in range(4)])
+        self.norm = RMSNorm(d_model)
+        self.attn_fc = nn.Sequential(nn.Linear(d_model, d_model // 4), nn.ReLU(), nn.Linear(d_model // 4, 4), nn.Softmax(dim=-1))
+    def forward(self, x_hw_c):
+        H, W, C = x_hw_c.shape; L = H * W
+        x1 = x_hw_c.reshape(1, L, C)
+        y1 = self.directions[0](x1)
+        x2 = x_hw_c.permute(1, 0, 2).reshape(1, L, C)
+        y2 = self.directions[1](x2).reshape(W, H, C).permute(1, 0, 2).reshape(1, L, C)
+        x3_img = torch.rot90(x_hw_c, 1, [0, 1])
+        x3 = x3_img.reshape(1, L, C)
+        y3 = self.directions[2](x3).reshape(W, H, C); y3 = torch.rot90(y3, -1, [0, 1]).reshape(1, L, C)
+        x4_img = torch.flip(x_hw_c, [1])
+        x4 = x4_img.reshape(1, L, C)
+        y4 = self.directions[3](x4).reshape(H, W, C); y4 = torch.flip(y4, [1]).reshape(1, L, C)
+        stacked = torch.cat([y1, y2, y3, y4], dim=0)
+        weights = self.attn_fc(stacked.mean(dim=1).mean(dim=0, keepdim=True))
+        out = (stacked * weights.view(4, 1, 1)).sum(dim=0)
+        return self.norm(out.squeeze(0))
+
+# class AdvancedPixelScanMamba(nn.Module):
+#     """
+#     [Ablation Version] No-Mamba (Identity Mapping)
+#     用于验证：移除 Mamba 序列建模能力后，性能的下降幅度。
+#     """
+#     def __init__(self, d_model, d_state=16, expand=2):
+#         super().__init__()
+#         # 不初始化任何 Mamba 层，只有一个简单的归一化（保持数值分布一致）
+#         self.norm = RMSNorm(d_model)
+
+#     def forward(self, x_hw_c):
+#         # x_hw_c: [H, W, C]
+#         # 直接展平，不做任何扫描和序列建模
+#         out = x_hw_c.reshape(-1, x_hw_c.shape[-1]) # [L, C]
+        
+#         # 仅做 Norm，不做特征提取
+#         return self.norm(out)
+
+
+
+# class AdvancedPixelScanMamba(nn.Module):
+#     """
+#     [Ablation Version] 2-Directional Scanning (Horizontal & Vertical ONLY)
+#     用于验证：移除对角线扫描后，性能是否下降。
+#     """
+#     def __init__(self, d_model, d_state=16, expand=2):
+#         super().__init__()
+#         # 修改点 1: Mamba 模块数量从 4 改为 2
+#         self.directions = nn.ModuleList([
+#             Mamba(d_model=d_model, d_state=d_state, expand=expand) for _ in range(2)
+#         ])
+#         self.norm = RMSNorm(d_model)
+        
+#         # 修改点 2: 线性层输出维度从 4 改为 2
+#         self.attn_fc = nn.Sequential(
+#             nn.Linear(d_model, d_model // 4),
+#             nn.ReLU(),
+#             nn.Linear(d_model // 4, 2), # Output 2 weights
+#             nn.Softmax(dim=-1)
+#         )
+
+#     def forward(self, x_hw_c):
+#         H, W, C = x_hw_c.shape; L = H * W
+        
+#         # 1. Horizontal (Row-Major)
+#         x1 = x_hw_c.reshape(1, L, C)
+#         y1 = self.directions[0](x1)
+
+#         # 2. Vertical (Col-Major)
+#         x2 = x_hw_c.permute(1, 0, 2).reshape(1, L, C)
+#         y2 = self.directions[1](x2).reshape(W, H, C).permute(1, 0, 2).reshape(1, L, C)
+
+#         # --- [已移除对角线扫描 x3, x4] ---
+
+#         # 融合 2 个方向
+#         stacked = torch.cat([y1, y2], dim=0) # Shape: [2, L, C]
+        
+#         # 计算 2 个分支的权重
+#         weights = self.attn_fc(stacked.mean(dim=1).mean(dim=0, keepdim=True)) # [1, 2]
+        
+#         # 加权求和
+#         out = (stacked * weights.view(2, 1, 1)).sum(dim=0)
+#         return self.norm(out.squeeze(0))
+    
+
+class DynamicGeneAggregation(nn.Module):
+    def __init__(self, num_branches, channels):
+        super().__init__()
+        self.project = nn.Sequential(nn.Linear(channels, channels // 4), nn.ReLU(), nn.Linear(channels // 4, num_branches), nn.Softmax(dim=-1))
+    def forward(self, feature_list):
+        stack = torch.stack(feature_list, dim=0)
+        global_ctx = stack.mean(dim=1).mean(dim=0)
+        weights = self.project(global_ctx)
+        return (stack * weights.view(-1, 1, 1)).sum(dim=0)
+
+# class DynamicGeneAggregation(nn.Module):
+#     """
+#     [Ablation Version] Fixed Aggregation (Simple Summation)
+#     用于验证：移除动态注意力机制（退化为直接相加）后，性能是否下降。
+#     """
+#     def __init__(self, num_branches, channels):
+#         super().__init__()
+#         # 修改点 1: 移除所有可学习参数 (Attention Layer)
+#         # 这是一个“空”的初始化，因为固定求和不需要参数
+#         pass
+
+#     def forward(self, feature_list):
+#         # feature_list 是一个列表，包含 K 个形状为 [N, C] 的张量
+        
+#         # 1. 堆叠
+#         stack = torch.stack(feature_list, dim=0) # Shape: [K, N, C]
+        
+#         # 修改点 2: 移除权重计算，直接在维度 0 上求和
+#         # 原逻辑: out = (stack * weights).sum(0)
+#         # 现逻辑: 直接 sum
+#         out = stack.sum(dim=0) # Shape: [N, C]
+        
+#         return out
+
+class MambaChannelAttention(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.mamba = Mamba(d_model=channels, d_state=8, expand=1); self.norm = RMSNorm(channels)
+    def forward(self, x_nc):
+        v = x_nc.mean(dim=0, keepdim=True); s = self.norm(v).unsqueeze(1)
+        a = torch.sigmoid(self.mamba(s).squeeze(1))
+        return x_nc * a
+
+class ChebnetII_prop(MessagePassing):
+    def __init__(self, K: int, **kwargs):
+        super().__init__(aggr="add", **kwargs)
+        self.K = K; self.temp = nn.Parameter(torch.ones(self.K + 1))
+    def forward(self, x, edge_index, edge_weight=None):
+        num_nodes = x.size(0); coe = F.relu(self.temp).clone()
+        edge_index_norm, norm = get_laplacian(edge_index, edge_weight, normalization="sym", dtype=x.dtype, num_nodes=num_nodes)
+        edge_index_tilde, norm_tilde = add_self_loops(edge_index_norm, norm, fill_value=-1.0, num_nodes=num_nodes)
+        Tx_0 = x; Tx_1 = self.propagate(edge_index_tilde, x=x, norm=norm_tilde)
+        out = coe[0] / 2 * Tx_0 + coe[1] * Tx_1
+        for k in range(2, self.K + 1):
+            Tx_2 = self.propagate(edge_index_tilde, x=Tx_1, norm=norm_tilde); Tx_2 = 2 * Tx_2 - Tx_0
+            out = out + coe[k] * Tx_2; Tx_0, Tx_1 = Tx_1, Tx_2
+        return out
+
+class ChebyshevGCNLayer(nn.Module):
+    def __init__(self, input_dim, output_dim, adjacency_matrix, k_order=2):
+        super().__init__()
+        self.input_norm = nn.BatchNorm1d(input_dim); self.project = nn.Linear(input_dim, output_dim)
+        self.output_norm = nn.BatchNorm1d(output_dim); self.activation = nn.LeakyReLU(inplace=True)
+        self.cheb_prop = ChebnetII_prop(K=k_order)
+        edge_index, edge_weight = dense_to_sparse(adjacency_matrix)
+        self.register_buffer("edge_index", edge_index.long()); self.register_buffer("edge_weight", edge_weight)
+    def forward(self, H):
+        H = self.input_norm(H); H = self.project(H)
+        out = self.cheb_prop(H, self.edge_index, self.edge_weight)
+        return self.activation(self.output_norm(out))
+
+# class ChebyshevGCNLayer(nn.Module):
+#     """
+#     [Ablation Version] MLP Only (No Graph Propagation)
+#     用于验证：如果不使用邻接矩阵 (A_list) 进行图传播，仅做线性变换，性能如何。
+#     """
+#     def __init__(self, input_dim, output_dim, adjacency_matrix, k_order=2):
+#         super().__init__()
+#         self.input_norm = nn.BatchNorm1d(input_dim)
+#         self.project = nn.Linear(input_dim, output_dim) # 仅保留线性层
+#         self.output_norm = nn.BatchNorm1d(output_dim)
+#         self.activation = nn.LeakyReLU(inplace=True)
+        
+#         # 这里的 adjacency_matrix 和 k_order 不再被使用
+#         # 也就是切断了“图”的连接
+
+#     def forward(self, H):
+#         # H: [Num_Nodes, Input_Dim]
+        
+#         # 1. Norm
+#         H = self.input_norm(H)
+        
+#         # 2. Linear Projection (MLP)
+#         # 关键修改：直接通过 Linear 层，而不是通过 cheb_prop (图卷积)
+#         out = self.project(H)
+        
+#         # 3. Activation & Norm
+#         return self.activation(self.output_norm(out))
+
+class SSConv(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=5):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.BatchNorm2d(in_ch), nn.Conv2d(in_ch, out_ch, 1), nn.LeakyReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size, padding=kernel_size//2, groups=out_ch), nn.LeakyReLU(inplace=True)
+        )
+    def forward(self, x): return self.conv(x)
+
+class GCNASnet_Final(nn.Module):
+    def __init__(self, args, hierarchy_matrices, adjacency_matrices):
+        super().__init__()
+        self.channel = args.bands; self.class_num = args.class_num
+        self.H_list = hierarchy_matrices; self.A_list = adjacency_matrices
+        self.layer_count = args.Unet_depth
+        self.H_list_Hat_T = [(temp / (torch.sum(temp, 0, keepdim=True) + 1e-6)).t() for temp in hierarchy_matrices]
+        layer_channels = 8; Layers = [layer_channels]
+        for _ in range(self.layer_count): layer_channels *= 2; Layers.append(layer_channels)
+
+        self.CNN_head_layer = SSConv(self.channel, Layers[-1], kernel_size=5)
+        self.pixel_cross = AdvancedPixelScanMamba(d_model=Layers[-1])
+        self.chan_attn = MambaChannelAttention(channels=Layers[-1])
+
+        self.En_GCN_layers0 = nn.ModuleList([ChebyshevGCNLayer(Layers[-i-1], Layers[-i-2], self.A_list[i]) for i in range(self.layer_count-1)])
+        self.En_GCN_layers1 = nn.ModuleList([ChebyshevGCNLayer(Layers[-i-2], Layers[0], self.A_list[-1]) for i in range(self.layer_count-1)])
+        self.gene_en_agg = DynamicGeneAggregation(len(self.En_GCN_layers1), Layers[0])
+
+        self.bottleneck_dim = Layers[0]
+        self.bottleneck_mamba = Mamba(d_model=self.bottleneck_dim, d_state=16)
+        self.bottleneck_norm = RMSNorm(self.bottleneck_dim)
+
+        self.De_GCN_layers0 = nn.ModuleList([ChebyshevGCNLayer(Layers[i]+Layers[i+1], Layers[i+1], self.A_list[-i-2]) for i in range(self.layer_count-2)])
+        self.De_GCN_layers1 = nn.ModuleList([ChebyshevGCNLayer(Layers[i]+Layers[-2], Layers[-2], self.A_list[0]) for i in range(self.layer_count-1)])
+        self.gene_de_agg = DynamicGeneAggregation(len(self.De_GCN_layers1), Layers[-2])
+
+        self.CNN_tail_layer = SSConv(Layers[-1] + Layers[-2], Layers[-1], kernel_size=5)
+        self.classifier = nn.Linear(Layers[-1], self.class_num)
+        self.aux_classifier = nn.Linear(Layers[-1], self.class_num)
+
+    def forward(self, x_hwc):
+        (h, w, c) = x_hwc.shape
+        encoder_features0 = []; encoder_features1 = []
+        decoder_features0 = []; decoder_features1 = []
+
+        x_i = torch.unsqueeze(x_hwc.permute([2, 0, 1]), 0)
+        H_0 = self.CNN_head_layer(x_i); H_0 = torch.squeeze(H_0, 0).permute([1, 2, 0]).contiguous()
+        H_0_flat = self.pixel_cross(H_0); H_0_flat = self.chan_attn(H_0_flat)
+        logits_aux = self.aux_classifier(H_0_flat)
+
+        H_i = torch.mm(self.H_list_Hat_T[0], H_0_flat)
+        H_i = self.En_GCN_layers0[0](H_i); encoder_features0.append(H_i)
+
+        t = 1
+        for i in range(len(self.En_GCN_layers0) - 1):
+            H_i = torch.mm(self.H_list_Hat_T[t], H_i); t += len(self.En_GCN_layers0) - i
+            H_i = self.En_GCN_layers0[i + 1](H_i); encoder_features0.append(H_i)
+
+        t = len(self.En_GCN_layers1)
+        for i in range(len(self.En_GCN_layers1)):
+            H_i = torch.mm(self.H_list_Hat_T[t], encoder_features0[i]); t += len(self.En_GCN_layers1) - 1 - i
+            H_i = self.En_GCN_layers1[i](H_i); encoder_features1.append(H_i)
+
+        final_encoder_feature = self.gene_en_agg(encoder_features1)
+        bn_input = final_encoder_feature.unsqueeze(0)
+        bn_out = self.bottleneck_mamba(bn_input)
+        final_encoder_feature = final_encoder_feature + self.bottleneck_norm(bn_out).squeeze(0)
+        H_i = final_encoder_feature; decoder_features0.append(H_i)
+
+        t = 1
+        for i in range(len(self.De_GCN_layers0)):
+            H_i = torch.mm(self.H_list[-t], H_i); t += i + 2
+            H_i = torch.cat([H_i, encoder_features0[-i - 1]], dim=-1)
+            H_i = self.De_GCN_layers0[i](H_i); decoder_features0.append(H_i)
+
+        for i in range(len(self.De_GCN_layers1)):
+            t = len(self.De_GCN_layers1) - i
+            H_i = torch.mm(self.H_list[t], decoder_features0[i])
+            H_i = torch.cat([H_i, encoder_features0[0]], dim=-1)
+            H_i = self.De_GCN_layers1[i](H_i); decoder_features1.append(H_i)
+
+        final_decoder_feature = self.gene_de_agg(decoder_features1)
+        H_i = torch.mm(self.H_list[0], final_decoder_feature)
+        H_i = torch.cat([H_i, H_0_flat], dim=-1)
+        final = self.CNN_tail_layer(H_i.reshape([1, h, w, -1]).permute([0, 3, 1, 2]))
+        final = final.squeeze(0).permute(1, 2, 0).reshape(h * w, -1)
+        logits_main = self.classifier(final)
+        
+        return logits_main, logits_aux
+
+# ==============================================================================
+# Main
+# ==============================================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="PU", help="IP, PU, SA")
+    parser.add_argument("--dataset_dir", type=str, default="/data/wk002/LGY/LSY/data/", help="data dir")
+    parser.add_argument("--train", type=int, default=30)
+    parser.add_argument("--val", type=int, default=10)
+    parser.add_argument("--Unet_depth", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--finetune_epochs", default=170, type=int)
+    parser.add_argument("--output_dir", type=str, default="./output/final_report/")
+    parser.add_argument("--amp", action="store_true")
+    args = parser.parse_args()
+
+    args.output_dir = os.path.abspath(args.output_dir)
+    logger, run_id = setup_logger(args.output_dir)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+
+    # Data Load
+    if args.dataset == "IP":
+        data_hsi = sio.loadmat(os.path.join(args.dataset_dir, "indian/Indian_pines_corrected.mat"))["indian_pines_corrected"]
+        data_gt = sio.loadmat(os.path.join(args.dataset_dir, "indian/Indian_pines_gt.mat"))["indian_pines_gt"]
+    elif args.dataset == "PU":
+        data_hsi = sio.loadmat(os.path.join(args.dataset_dir, "PaviaU/PaviaU.mat"))["paviaU"]
+        data_gt = sio.loadmat(os.path.join(args.dataset_dir, "PaviaU/PaviaU_gt.mat"))["paviaU_gt"]
+    elif args.dataset == "SA":
+        data_hsi = sio.loadmat(os.path.join(args.dataset_dir, "Salinas/Salinas_corrected.mat"))["salinas_corrected"]
+        data_gt = sio.loadmat(os.path.join(args.dataset_dir, "Salinas/Salinas_gt.mat"))["salinas_gt"]
+    
+    line, sample, band = data_hsi.shape
+    class_num = int(np.max(data_gt))
+    gt = data_gt.reshape(line * sample,)
+    
+    bands = 30
+    Xpca = data_hsi.reshape(-1, band)
+    Xpca = PCA(n_components=bands, whiten=False).fit_transform(Xpca).reshape(line, sample, bands)
+    args.bands = bands; args.class_num = class_num
+
+    # SLIC
+    tracker.start("segment")
+    SM = SegmentMap(Xpca, args.Unet_depth)
+    segments, A_list, H_list = SM.getHierarchy()
+    A_list_gpu = [torch.from_numpy(np.array(A, dtype=np.float32)).to(device) for A in A_list]
+    H_list_gpu = [torch.from_numpy(np.array(H, dtype=np.float32)).to(device) for H in H_list]
+    tracker.stop("segment")
+
+    # Split
+    train_gt, _, val_gt, _, _ = sampling_fixed(args.train, args.val, gt)
+    train_mask = get_label_mask(line, sample, class_num, train_gt)
+    val_mask = get_label_mask(line, sample, class_num, val_gt)
+
+    train_gt_t = torch.from_numpy(train_gt.astype(np.int64)).to(device)
+    val_gt_t = torch.from_numpy(val_gt.astype(np.int64)).to(device)
+    train_mask_t = torch.from_numpy(train_mask).to(device)
+    val_mask_t = torch.from_numpy(val_mask).to(device)
+    net_input = torch.from_numpy(Xpca.astype(np.float32)).to(device)
+
+    # Model & Params
+    model = GCNASnet_Final(args, H_list_gpu, A_list_gpu).to(device)
+    num_params = count_parameters(model)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.finetune_epochs, eta_min=1e-6)
+    scaler = amp.GradScaler(enabled=args.amp)
+    focal = ClassBalancedFocalLoss.from_labels(class_num, train_gt, gamma=2.0, device=device)
+
+    # Train
+    best_OA = 0.0
+    tracker.start("train")
+    for epoch in range(args.finetune_epochs):
+        model.train()
+        aux_w = max(0.1, 0.6 * (1 - epoch / args.finetune_epochs))
+
+        optimizer.zero_grad()
+        with amp.autocast(enabled=args.amp):
+            logits_main, logits_aux = model(net_input)
+            targets = train_gt_t.long() - 1
+            loss_m = focal(logits_main, targets, train_mask_t)
+            loss_a = focal(logits_aux, targets, train_mask_t)
+            loss = loss_m + aux_w * loss_a
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer); scaler.update()
+
+        # Val
+        model.eval()
+        with torch.no_grad():
+            logits_v, _ = model(net_input)
+            pred = torch.argmax(logits_v, dim=-1)
+            correct = (pred[val_mask_t] == (val_gt_t[val_mask_t]-1)).float().mean()
+            val_oa = correct.item()
+        
+        if val_oa > best_OA:
+            best_OA = val_oa
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
+        
+        scheduler.step()
+        if (epoch+1) % 10 == 0:
+            logger.info(f"Epoch {epoch+1}: Loss={loss.item():.4f}, AuxW={aux_w:.2f}, ValOA={val_oa:.4f}")
+
+    tracker.stop("train")
+
+    # ############################## Test #########################################################
+    # tracker.start("test")
+    # model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt")))
+    # model.eval()
+    # with torch.no_grad():
+    #     logits_t, _ = model(net_input)
+    # tracker.stop("test")
+    tracker.start("test")
+    model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt")))
+    model.eval()
+    
+    with torch.no_grad():
+        # 1. 原始预测
+        logits_1, _ = model(net_input)
+        
+        # 2. 水平翻转预测 (TTA)
+        input_flip = torch.flip(net_input, dims=[1]) 
+        logits_flip, _ = model(input_flip)
+        
+        # 3. 翻转回来并融合
+        # 注意：logits 是 [H*W, C], 需要先 reshape 成图片 [H, W, C] 再翻转
+        logits_flip = logits_flip.view(line, sample, -1)
+        logits_flip = torch.flip(logits_flip, dims=[1]).reshape(line*sample, -1)
+        
+        # 4. 取平均
+        logits_final = (logits_1 + logits_flip) / 2.0
+
+    tracker.stop("test")
+    
+    # 后面计算指标时，使用新的 logits_final
+    pred = torch.argmax(logits_final, dim=-1).cpu().numpy() + 1
+    pred = pred.reshape(line, sample)
+    pred[data_gt == 0] = 0
+    
+    res = pred[data_gt>0]; truth = data_gt[data_gt>0]
+    
+    # Calculate Metrics
+    OA = accuracy_score(truth, res)
+    confusion = confusion_matrix(truth, res)
+    per_class_acc = np.diag(confusion) / np.sum(confusion, axis=1)
+    AA = np.mean(per_class_acc)
+    Kappa = cohen_kappa_score(truth, res)
+
+    # Precision / Recall / F1 report (sklearn-style)
+    cls_report = classification_report(
+        truth,
+        res,
+        labels=list(range(1, class_num + 1)),
+        digits=4,
+        zero_division=0,
+    )
+    
+    # Plot (KSC palette)
+    ksc_color = np.array([
+        [0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [255, 0, 255], [0, 255, 255],
+        [200, 100, 0], [0, 200, 100], [100, 0, 200], [200, 0, 100], [100, 200, 0], [0, 100, 200],
+        [150, 75, 75], [75, 150, 75], [75, 75, 150], [255, 100, 100]
+    ], dtype=np.float32) / 255.0
+    cmap = matplotlib.colors.ListedColormap(ksc_color[:class_num + 1])
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    ax.imshow(pred, interpolation="none", cmap=cmap, vmin=0, vmax=class_num)
+    ax.set_title(f"Pred OA={OA:.4f}")
+    ax.axis("off")
+    fig.tight_layout()
+    # Keep a stable filename + a per-run snapshot
+    fig.savefig(os.path.join(args.output_dir, "result.png"), dpi=200)
+    fig.savefig(os.path.join(args.output_dir, f"result_{run_id}.png"), dpi=200)
+    plt.close(fig)
+    
+    # ==========================================================================
+    # FINAL REPORT BLOCK
+    # ==========================================================================
+    logger.info("\n")
+    logger.info("="*60)
+    logger.info(f"           EXPERIMENT RESULTS ({args.dataset})            ")
+    logger.info("="*60)
+    logger.info(f"{'Metric':<20} | {'Value':<15}")
+    logger.info("-" * 40)
+    logger.info(f"{'Overall Accuracy':<20} | {OA*100:.2f}%")
+    logger.info(f"{'Average Accuracy':<20} | {AA*100:.2f}%")
+    logger.info(f"{'Kappa Coefficient':<20} | {Kappa*100:.2f}")
+    logger.info("-" * 40)
+    logger.info(f"{'Train Time':<20} | {tracker.get_duration('train'):.4f} s")
+    logger.info(f"{'Test Time':<20} | {tracker.get_duration('test'):.4f} s")
+    logger.info(f"{'Segment Time':<20} | {tracker.get_duration('segment'):.4f} s")
+    logger.info("-" * 40)
+    logger.info(f"{'Total Params':<20} | {num_params/1e6:.4f} M")
+    logger.info("="*60)
+
+    logger.info("Classification Report (precision/recall/f1/support):")
+    logger.info("\n" + cls_report)
+    
+    logger.info("Per-Class Accuracy:")
+    for i, acc in enumerate(per_class_acc):
+        logger.info(f"Class {i+1:02d}: {acc*100:.2f}%")
+    logger.info("="*60)
+
+if __name__ == "__main__":
+    main()
