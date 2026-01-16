@@ -1,0 +1,1102 @@
+import argparse
+import datetime
+import json
+import logging
+import math
+import os
+import random
+import time
+from copy import deepcopy
+
+import numpy as np
+import scipy.io as sio
+import matplotlib
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda import amp
+
+from sklearn import preprocessing
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, cohen_kappa_score
+from sklearn.decomposition import PCA
+from skimage. segmentation import slic
+
+from torch_geometric.nn. conv import MessagePassing
+from torch_geometric.utils import add_self_loops, get_laplacian, dense_to_sparse
+
+# ==============================================================================
+# Logger & Utils
+# ==============================================================================
+def seed_everything(seed=3407):
+    """设置所有随机种子以确保可复现性"""
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def setup_logger(output_dir:  str):
+    """设置日志记录器"""
+    os.makedirs(os.path.join(output_dir, "log"), exist_ok=True)
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(output_dir, "log", f"log_run_{run_id}.txt")
+    logger = logging.getLogger(f"GCNAS-Final-{run_id}")
+    logger.setLevel(logging.INFO)
+    
+    def beijing(sec, what):
+        return datetime.datetime.now().timetuple()
+    
+    logging. Formatter.converter = beijing
+    formatter = logging.Formatter("%(asctime)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    
+    return logger, run_id
+
+
+def count_parameters(model):
+    """统计模型可训练参数数量"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+class TimeTracker:
+    """时间追踪器"""
+    def __init__(self):
+        self.phases = {}
+    
+    def start(self, phase):
+        self.phases[phase] = {"start": time.time(), "end": None}
+    
+    def stop(self, phase):
+        if phase in self.phases:
+            self.phases[phase]["end"] = time.time()
+    
+    def get_duration(self, phase):
+        if phase in self.phases and self.phases[phase]["end"]:
+            return self.phases[phase]["end"] - self.phases[phase]["start"]
+        return 0.0
+
+
+class EarlyStopping:
+    """早停机制"""
+    def __init__(self, patience=20, min_delta=0.0, mode='max'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.best_epoch = 0
+    
+    def __call__(self, score, epoch):
+        if self.best_score is None: 
+            self.best_score = score
+            self.best_epoch = epoch
+            return True  # 第一次总是保存
+        
+        if self.mode == 'max':
+            improved = score > self.best_score + self.min_delta
+        else:
+            improved = score < self.best_score - self.min_delta
+        
+        if improved:
+            self.best_score = score
+            self.best_epoch = epoch
+            self.counter = 0
+            return True  # 需要保存模型
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+            return False  # 不需要保存模型
+
+
+def save_config(args, output_dir, run_id, num_params, additional_info=None):
+    """保存实验配置"""
+    config = vars(args).copy()
+    config['num_params'] = num_params
+    config['num_params_M'] = num_params / 1e6
+    config['run_id'] = run_id
+    
+    if additional_info:
+        config. update(additional_info)
+    
+    config_path = os.path.join(output_dir, f'config_{run_id}.json')
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    return config_path
+
+
+# ==============================================================================
+# Mamba Imports
+# ==============================================================================
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    from mamba_ssm.modules.mamba_simple import Mamba
+
+try:
+    from mamba_ssm.ops.triton. layernorm import RMSNorm
+except Exception:
+    RMSNorm = nn.LayerNorm
+
+
+# ==============================================================================
+# Data Utils
+# ==============================================================================
+def SegmentsLabelProcess(line, sample, labels):
+    """处理超像素分割标签，确保标签连续"""
+    labels = np.array(labels, np.int64)
+    ls = list(set(np.reshape(labels, [-1]).tolist()))
+    dic = {ls[i]: i for i in range(len(ls))}
+    new_labels = labels. copy()
+    for i in range(line):
+        for j in range(sample):
+            new_labels[i, j] = dic[new_labels[i, j]]
+    return new_labels
+
+
+class SegmentMap(object):
+    """超像素分割图生成器"""
+    def __init__(self, data_in, Unet_depth=3, random_seed=3407):
+        self.line, self.sample, self.band = data_in. shape
+        data = np.reshape(data_in, [self.line * self.sample, self.band])
+        self.data = np.reshape(
+            preprocessing.StandardScaler().fit_transform(data),
+            [self. line, self.sample, self. band]
+        )
+        self. Unet_depth = Unet_depth
+        self.random_seed = random_seed
+
+    def getHierarchy(self):
+        """生成层次化超像素分割"""
+        # 设置随机种子以确保SLIC可复现
+        np.random.seed(self.random_seed)
+        
+        h, w = self.line, self.sample
+        n_s = 256
+        n_segments = []
+        for _ in range(self.Unet_depth):
+            n_segments.append(n_s)
+            n_s = n_s * 2
+
+        segs = []
+        for i in range(self.Unet_depth):
+            segment = slic(
+                self.data,
+                n_segments=n_segments[-i - 1],
+                compactness=0.5,
+                max_num_iter=20,
+                sigma=1,
+                convert2lab=False,
+                enforce_connectivity=False,
+                start_label=1,
+                min_size_factor=0.1,
+                max_size_factor=2,
+                slic_zero=False
+            )
+            if segment.max() + 1 != len(np.unique(segment)):
+                segment = SegmentsLabelProcess(h, w, segment)
+            segs.append(segment)
+
+        # 构建邻接矩阵
+        A_list = []
+        for l in range(len(segs)):
+            map_ = np.reshape(segs[l], [h, w])
+            count = int(np.max(segs[l])) + 1
+            A = torch.zeros([count, count], dtype=torch.int16)
+            right = np.vstack([map_[: , :-1]. ravel(), map_[:, 1:].ravel()]).T
+            down = np.vstack([map_[:-1, :].ravel(), map_[1:, :]. ravel()]).T
+            edges = np.vstack([
+                right[right[: , 0] != right[:, 1]],
+                down[down[:, 0] != down[:, 1]]
+            ])
+            if len(edges) > 0:
+                for u, v in edges:
+                    A[u, v] = A[v, u] = 1
+            A_list.append(A)
+
+        # 添加像素级分割
+        segs = np.concatenate([
+            np.reshape([i for i in range(h * w)], [1, h, w]),
+            segs
+        ], axis=0)
+        
+        # 构建层次映射矩阵
+        H_list_full = []
+        
+        # Level 0->1
+        S = np.zeros([np.max(segs[0]) + 1, np.max(segs[1]) + 1], dtype=np.float32)
+        l1, l2 = np.reshape(segs[0], [-1]), np.reshape(segs[1], [-1])
+        coords = np.stack([l1, l2])
+        coords = np.unique(coords, axis=1)
+        S[coords[0], coords[1]] = 1
+        H_list_full.append(S)
+        
+        for i in range(self.Unet_depth - 1):
+            for j in range(self.Unet_depth - 1 - i):
+                S = np.zeros([np.max(segs[i + 1]) + 1, np.max(segs[i + j + 2]) + 1], dtype=np.float32)
+                l1, l2 = np.reshape(segs[i + 1], [-1]), np.reshape(segs[i + j + 2], [-1])
+                coords = np.stack([l1, l2])
+                coords = np.unique(coords, axis=1)
+                S[coords[0], coords[1]] = 1
+                H_list_full. append(S)
+        
+        return segs, A_list, H_list_full
+
+
+def sampling_fixed(proportion_train, proportion_val, groundtruth, random_seed=3407):
+    """
+    固定比例采样训练集、验证集和测试集
+    
+    修复：
+    1. 正确的数据集划分逻辑
+    2. 返回所有必要的掩码
+    3. 添加随机种子参数
+    """
+    np. random.seed(random_seed)
+    
+    classnum = int(max(groundtruth))
+    train_gt = np.zeros_like(groundtruth)
+    val_gt = np.zeros_like(groundtruth)
+    test_gt = np.zeros_like(groundtruth)
+    
+    for i in range(classnum):
+        indexes = [j for j, x in enumerate(groundtruth. ravel().tolist()) if x == i + 1]
+        np.random.shuffle(indexes)
+        
+        if proportion_train < 1:
+            # 按比例划分
+            n_train = max(int(proportion_train * len(indexes)), 2)
+            n_val = max(int(proportion_val * len(indexes)), 2)
+        else:
+            # 按固定数量划分
+            limit = len(indexes)
+            n_train = int(min(proportion_train, limit * 0.5))
+            n_val = int(min(proportion_val, limit * 0.3))
+            n_train = max(n_train, 2)
+            n_val = max(n_val, 2)
+        
+        # 确保不超过样本总数
+        if n_train + n_val >= len(indexes):
+            n_train = max(len(indexes) // 3, 1)
+            n_val = max(len(indexes) // 3, 1)
+        
+        # 正确划分：训练集 | 验证集 | 测试集
+        train_idx = indexes[:n_train]
+        val_idx = indexes[n_train:n_train + n_val]
+        test_idx = indexes[n_train + n_val:]
+        
+        train_gt[train_idx] = groundtruth[train_idx]
+        val_gt[val_idx] = groundtruth[val_idx]
+        test_gt[test_idx] = groundtruth[test_idx]
+
+    return train_gt, val_gt, test_gt
+
+
+def get_label_mask(line, sample, class_num, samples):
+    """生成标签掩码"""
+    mask = np.zeros((line * sample,), dtype=np.bool_)
+    mask[samples != 0] = True
+    return mask
+
+
+class ClassBalancedFocalLoss(nn.Module):
+    """类别平衡的Focal Loss"""
+    def __init__(self, num_classes:  int, gamma: float = 3.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        self.register_buffer("alpha", alpha)
+    
+    @staticmethod
+    def from_labels(num_classes: int, labels: np.ndarray, gamma: float = 2.0, device=None):
+        counts = np.zeros((num_classes,), dtype=np.float64)
+        for c in range(1, num_classes + 1):
+            counts[c - 1] = np.sum(labels == c)
+        inv = 1.0 / np.maximum(counts, 1.0)
+        alpha = inv / inv.mean()
+        return ClassBalancedFocalLoss(
+            num_classes=num_classes,
+            gamma=gamma,
+            alpha=torch.tensor(alpha, dtype=torch.float32, device=device)
+        )
+    
+    def forward(self, logits, targets, mask):
+        if mask. sum() == 0:
+            return logits. sum() * 0.0
+        
+        logits_m, targets_m = logits[mask], targets[mask]
+        logp = F.log_softmax(logits_m, dim=-1)
+        p = torch.exp(logp)
+        logpt = logp. gather(1, targets_m. view(-1, 1)).squeeze(1)
+        pt = p.gather(1, targets_m.view(-1, 1)).squeeze(1)
+        alpha_t = self.alpha. gather(0, targets_m)
+        loss = -alpha_t * (1.0 - pt).pow(self.gamma) * logpt
+        return loss.mean()
+
+
+# ==============================================================================
+# Model Modules
+# ==============================================================================
+class AdvancedPixelScanMamba(nn.Module):
+    """
+    多方向Mamba扫描模块
+    4个扫描方向：水平、垂直、旋转90°、水平翻转
+    通过可学习的注意力权重动态融合
+    """
+    def __init__(self, d_model, d_state=16, expand=2):
+        super().__init__()
+        self.directions = nn.ModuleList([
+            Mamba(d_model=d_model, d_state=d_state, expand=expand)
+            for _ in range(4)
+        ])
+        self.norm = RMSNorm(d_model)
+        self.attn_fc = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, 4),
+            nn.Softmax(dim=-1)
+        )
+    
+    def forward(self, x_hw_c):
+        H, W, C = x_hw_c. shape
+        L = H * W
+        
+        # 方向1：水平扫描 (Row-Major)
+        x1 = x_hw_c. reshape(1, L, C)
+        y1 = self.directions[0](x1)
+        
+        # 方向2：垂直扫描 (Column-Major)
+        x2 = x_hw_c.permute(1, 0, 2).reshape(1, L, C)
+        y2 = self. directions[1](x2).reshape(W, H, C).permute(1, 0, 2).reshape(1, L, C)
+        
+        # 方向3：旋转90°扫描
+        x3_img = torch.rot90(x_hw_c, 1, [0, 1])
+        x3 = x3_img.reshape(1, L, C)
+        y3 = self.directions[2](x3).reshape(W, H, C)
+        y3 = torch.rot90(y3, -1, [0, 1]).reshape(1, L, C)
+        
+        # 方向4：水平翻转扫描
+        x4_img = torch.flip(x_hw_c, [1])
+        x4 = x4_img.reshape(1, L, C)
+        y4 = self.directions[3](x4).reshape(H, W, C)
+        y4 = torch.flip(y4, [1]).reshape(1, L, C)
+        
+        # 动态注意力融合
+        stacked = torch.cat([y1, y2, y3, y4], dim=0)
+        weights = self.attn_fc(stacked. mean(dim=1).mean(dim=0, keepdim=True))
+        out = (stacked * weights.view(4, 1, 1)).sum(dim=0)
+        
+        return self. norm(out. squeeze(0))
+
+
+class DynamicGeneAggregation(nn.Module):
+    """动态基因聚合模块"""
+    def __init__(self, num_branches, channels):
+        super().__init__()
+        self.project = nn.Sequential(
+            nn.Linear(channels, channels // 4),
+            nn.ReLU(),
+            nn.Linear(channels // 4, num_branches),
+            nn.Softmax(dim=-1)
+        )
+    
+    def forward(self, feature_list):
+        stack = torch.stack(feature_list, dim=0)
+        global_ctx = stack.mean(dim=1).mean(dim=0)
+        weights = self.project(global_ctx)
+        return (stack * weights. view(-1, 1, 1)).sum(dim=0)
+
+
+class MambaChannelAttention(nn.Module):
+    """Mamba通道注意力模块"""
+    def __init__(self, channels):
+        super().__init__()
+        self.mamba = Mamba(d_model=channels, d_state=8, expand=1)
+        self.norm = RMSNorm(channels)
+    
+    def forward(self, x_nc):
+        v = x_nc.mean(dim=0, keepdim=True)
+        s = self.norm(v).unsqueeze(1)
+        a = torch.sigmoid(self.mamba(s).squeeze(1))
+        return x_nc * a
+
+
+class ChebnetII_prop(MessagePassing):
+    """Chebyshev图卷积传播"""
+    def __init__(self, K:  int, **kwargs):
+        super().__init__(aggr="add", **kwargs)
+        self.K = K
+        self.temp = nn.Parameter(torch.ones(self.K + 1))
+    
+    def forward(self, x, edge_index, edge_weight=None):
+        num_nodes = x.size(0)
+        coe = F.relu(self.temp).clone()
+        
+        edge_index_norm, norm = get_laplacian(
+            edge_index, edge_weight,
+            normalization="sym",
+            dtype=x.dtype,
+            num_nodes=num_nodes
+        )
+        edge_index_tilde, norm_tilde = add_self_loops(
+            edge_index_norm, norm,
+            fill_value=-1.0,
+            num_nodes=num_nodes
+        )
+        
+        Tx_0 = x
+        Tx_1 = self.propagate(edge_index_tilde, x=x, norm=norm_tilde)
+        out = coe[0] / 2 * Tx_0 + coe[1] * Tx_1
+        
+        for k in range(2, self.K + 1):
+            Tx_2 = self.propagate(edge_index_tilde, x=Tx_1, norm=norm_tilde)
+            Tx_2 = 2 * Tx_2 - Tx_0
+            out = out + coe[k] * Tx_2
+            Tx_0, Tx_1 = Tx_1, Tx_2
+        
+        return out
+    
+    def message(self, x_j, norm):
+        return norm.view(-1, 1) * x_j
+
+
+class ChebyshevGCNLayer(nn.Module):
+    """Chebyshev图卷积层"""
+    def __init__(self, input_dim, output_dim, adjacency_matrix, k_order=2):
+        super().__init__()
+        self.input_norm = nn.BatchNorm1d(input_dim)
+        self.project = nn.Linear(input_dim, output_dim)
+        self.output_norm = nn.BatchNorm1d(output_dim)
+        self.activation = nn.LeakyReLU(inplace=True)
+        self.cheb_prop = ChebnetII_prop(K=k_order)
+        
+        edge_index, edge_weight = dense_to_sparse(adjacency_matrix)
+        self.register_buffer("edge_index", edge_index. long())
+        self.register_buffer("edge_weight", edge_weight)
+    
+    def forward(self, H):
+        H = self.input_norm(H)
+        H = self.project(H)
+        out = self.cheb_prop(H, self. edge_index, self.edge_weight)
+        return self.activation(self.output_norm(out))
+
+
+class SSConv(nn.Module):
+    """空间-光谱卷积模块"""
+    def __init__(self, in_ch, out_ch, kernel_size=5):
+        super().__init__()
+        self.conv = nn. Sequential(
+            nn.BatchNorm2d(in_ch),
+            nn.Conv2d(in_ch, out_ch, 1),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size, padding=kernel_size // 2, groups=out_ch),
+            nn.LeakyReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        return self.conv(x)
+
+
+class GCNASnet_Final(nn.Module):
+    """GCN-Mamba主网络"""
+    def __init__(self, args, hierarchy_matrices, adjacency_matrices):
+        super().__init__()
+        self.channel = args.bands
+        self.class_num = args.class_num
+        self.H_list = hierarchy_matrices
+        self.A_list = adjacency_matrices
+        self.layer_count = args. Unet_depth
+        
+        # 预计算层次映射矩阵的转置归一化版本
+        self.H_list_Hat_T = [
+            (temp / (torch.sum(temp, 0, keepdim=True) + 1e-6)).t()
+            for temp in hierarchy_matrices
+        ]
+        
+        # 计算每层通道数
+        layer_channels = 8
+        Layers = [layer_channels]
+        for _ in range(self.layer_count):
+            layer_channels *= 2
+            Layers.append(layer_channels)
+
+        # CNN头部
+        self.CNN_head_layer = SSConv(self.channel, Layers[-1], kernel_size=5)
+        
+        # 像素级Mamba扫描
+        self.pixel_cross = AdvancedPixelScanMamba(d_model=Layers[-1])
+        self.chan_attn = MambaChannelAttention(channels=Layers[-1])
+
+        # 编码器GCN层
+        self.En_GCN_layers0 = nn.ModuleList([
+            ChebyshevGCNLayer(Layers[-i - 1], Layers[-i - 2], self.A_list[i])
+            for i in range(self.layer_count - 1)
+        ])
+        self.En_GCN_layers1 = nn.ModuleList([
+            ChebyshevGCNLayer(Layers[-i - 2], Layers[0], self.A_list[-1])
+            for i in range(self.layer_count - 1)
+        ])
+        self.gene_en_agg = DynamicGeneAggregation(len(self.En_GCN_layers1), Layers[0])
+
+        # 瓶颈层
+        self.bottleneck_dim = Layers[0]
+        self.bottleneck_mamba = Mamba(d_model=self.bottleneck_dim, d_state=16)
+        self.bottleneck_norm = RMSNorm(self.bottleneck_dim)
+
+        # 解码器GCN层
+        self.De_GCN_layers0 = nn.ModuleList([
+            ChebyshevGCNLayer(Layers[i] + Layers[i + 1], Layers[i + 1], self.A_list[-i - 2])
+            for i in range(self.layer_count - 2)
+        ])
+        self.De_GCN_layers1 = nn.ModuleList([
+            ChebyshevGCNLayer(Layers[i] + Layers[-2], Layers[-2], self.A_list[0])
+            for i in range(self.layer_count - 1)
+        ])
+        self.gene_de_agg = DynamicGeneAggregation(len(self.De_GCN_layers1), Layers[-2])
+
+        # CNN尾部
+        self.CNN_tail_layer = SSConv(Layers[-1] + Layers[-2], Layers[-1], kernel_size=5)
+        
+        # 分类器
+        self.classifier = nn.Linear(Layers[-1], self.class_num)
+        self.aux_classifier = nn.Linear(Layers[-1], self.class_num)
+
+    def forward(self, x_hwc):
+        (h, w, c) = x_hwc.shape
+        encoder_features0 = []
+        encoder_features1 = []
+        decoder_features0 = []
+        decoder_features1 = []
+
+        # CNN头部处理
+        x_i = torch.unsqueeze(x_hwc. permute([2, 0, 1]), 0)
+        H_0 = self.CNN_head_layer(x_i)
+        H_0 = torch.squeeze(H_0, 0).permute([1, 2, 0]).contiguous()
+        
+        # Mamba扫描和通道注意力
+        H_0_flat = self.pixel_cross(H_0)
+        H_0_flat = self.chan_attn(H_0_flat)
+        
+        # 辅助分类器输出
+        logits_aux = self.aux_classifier(H_0_flat)
+
+        # 编码器：像素到超像素
+        H_i = torch.mm(self.H_list_Hat_T[0], H_0_flat)
+        H_i = self.En_GCN_layers0[0](H_i)
+        encoder_features0.append(H_i)
+
+        t = 1
+        for i in range(len(self.En_GCN_layers0) - 1):
+            H_i = torch.mm(self. H_list_Hat_T[t], H_i)
+            t += len(self.En_GCN_layers0) - i
+            H_i = self.En_GCN_layers0[i + 1](H_i)
+            encoder_features0.append(H_i)
+
+        t = len(self.En_GCN_layers1)
+        for i in range(len(self.En_GCN_layers1)):
+            H_i = torch. mm(self.H_list_Hat_T[t], encoder_features0[i])
+            t += len(self.En_GCN_layers1) - 1 - i
+            H_i = self.En_GCN_layers1[i](H_i)
+            encoder_features1.append(H_i)
+
+        # 动态聚合编码器特征
+        final_encoder_feature = self.gene_en_agg(encoder_features1)
+        
+        # 瓶颈层Mamba处理
+        bn_input = final_encoder_feature. unsqueeze(0)
+        bn_out = self.bottleneck_mamba(bn_input)
+        final_encoder_feature = final_encoder_feature + self.bottleneck_norm(bn_out).squeeze(0)
+        
+        H_i = final_encoder_feature
+        decoder_features0.append(H_i)
+
+        # 解码器：超像素到像素
+        t = 1
+        for i in range(len(self.De_GCN_layers0)):
+            H_i = torch. mm(self.H_list[-t], H_i)
+            t += i + 2
+            H_i = torch.cat([H_i, encoder_features0[-i - 1]], dim=-1)
+            H_i = self.De_GCN_layers0[i](H_i)
+            decoder_features0.append(H_i)
+
+        for i in range(len(self. De_GCN_layers1)):
+            t = len(self.De_GCN_layers1) - i
+            H_i = torch.mm(self.H_list[t], decoder_features0[i])
+            H_i = torch.cat([H_i, encoder_features0[0]], dim=-1)
+            H_i = self.De_GCN_layers1[i](H_i)
+            decoder_features1.append(H_i)
+
+        # 动态聚合解码器特征
+        final_decoder_feature = self.gene_de_agg(decoder_features1)
+        
+        # 恢复到像素级
+        H_i = torch.mm(self.H_list[0], final_decoder_feature)
+        H_i = torch.cat([H_i, H_0_flat], dim=-1)
+        
+        # CNN尾部处理
+        final = self.CNN_tail_layer(H_i. reshape([1, h, w, -1]).permute([0, 3, 1, 2]))
+        final = final.squeeze(0).permute(1, 2, 0).reshape(h * w, -1)
+        
+        # 主分类器输出
+        logits_main = self.classifier(final)
+        
+        return logits_main, logits_aux
+
+
+def apply_tta(model, net_input, line, sample, class_num):
+    """
+    应用测试时数据增强 (Test Time Augmentation)
+    支持多种翻转方式
+    """
+    model.eval()
+    logits_list = []
+    
+    with torch.no_grad():
+        # 1. 原始预测
+        logits_1, _ = model(net_input)
+        logits_list. append(logits_1)
+        
+        # 2. 水平翻转
+        input_flip_h = torch.flip(net_input, dims=[1])
+        logits_flip_h, _ = model(input_flip_h)
+        logits_flip_h = logits_flip_h.view(line, sample, -1)
+        logits_flip_h = torch.flip(logits_flip_h, dims=[1]).reshape(line * sample, -1)
+        logits_list.append(logits_flip_h)
+        
+        # 3. 垂直翻转
+        input_flip_v = torch.flip(net_input, dims=[0])
+        logits_flip_v, _ = model(input_flip_v)
+        logits_flip_v = logits_flip_v.view(line, sample, -1)
+        logits_flip_v = torch. flip(logits_flip_v, dims=[0]).reshape(line * sample, -1)
+        logits_list.append(logits_flip_v)
+        
+        # 4. 对角翻转 (水平+垂直)
+        input_flip_hv = torch.flip(net_input, dims=[0, 1])
+        logits_flip_hv, _ = model(input_flip_hv)
+        logits_flip_hv = logits_flip_hv.view(line, sample, -1)
+        logits_flip_hv = torch.flip(logits_flip_hv, dims=[0, 1]).reshape(line * sample, -1)
+        logits_list.append(logits_flip_hv)
+        
+        # 融合所有预测
+        logits_final = torch.stack(logits_list, dim=0).mean(dim=0)
+    
+    return logits_final
+
+
+def calculate_metrics(pred, truth, class_num):
+    """计算所有评估指标"""
+    OA = accuracy_score(truth, pred)
+    confusion = confusion_matrix(truth, pred)
+    per_class_acc = np.diag(confusion) / np.sum(confusion, axis=1)
+    AA = np.mean(per_class_acc)
+    Kappa = cohen_kappa_score(truth, pred)
+    
+    cls_report = classification_report(
+        truth,
+        pred,
+        labels=list(range(1, class_num + 1)),
+        digits=4,
+        zero_division=0,
+    )
+    
+    return {
+        'OA': OA,
+        'AA': AA,
+        'Kappa':  Kappa,
+        'per_class_acc': per_class_acc,
+        'confusion_matrix': confusion,
+        'classification_report': cls_report
+    }
+
+
+def plot_results(pred, data_gt, class_num, output_dir, run_id, OA):
+    """绘制分类结果图"""
+    ksc_color = np.array([
+        [0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
+        [255, 0, 255], [0, 255, 255], [200, 100, 0], [0, 200, 100],
+        [100, 0, 200], [200, 0, 100], [100, 200, 0], [0, 100, 200],
+        [150, 75, 75], [75, 150, 75], [75, 75, 150], [255, 100, 100]
+    ], dtype=np.float32) / 255.0
+    
+    cmap = matplotlib.colors.ListedColormap(ksc_color[: class_num + 1])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # 预测结果
+    axes[0].imshow(pred, interpolation="none", cmap=cmap, vmin=0, vmax=class_num)
+    axes[0].set_title(f"Prediction (OA={OA:.4f})")
+    axes[0].axis("off")
+    
+    # Ground Truth
+    axes[1].imshow(data_gt, interpolation="none", cmap=cmap, vmin=0, vmax=class_num)
+    axes[1].set_title("Ground Truth")
+    axes[1].axis("off")
+    
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "result.png"), dpi=200)
+    fig.savefig(os.path.join(output_dir, f"result_{run_id}.png"), dpi=200)
+    plt.close(fig)
+
+
+# ==============================================================================
+# Main
+# ==============================================================================
+def main():
+    parser = argparse.ArgumentParser(description="GCN-Mamba for Hyperspectral Image Classification")
+    parser.add_argument("--dataset", type=str, default="PU", choices=["IP", "PU", "SA"],
+                        help="Dataset name:  IP (Indian Pines), PU (Pavia University), SA (Salinas)")
+    parser.add_argument("--dataset_dir", type=str, default="/data/wk002/LGY/LSY/data/",
+                        help="Dataset directory path")
+    parser.add_argument("--train", type=int, default=30,
+                        help="Number or ratio of training samples per class")
+    parser.add_argument("--val", type=int, default=10,
+                        help="Number or ratio of validation samples per class")
+    parser.add_argument("--Unet_depth", type=int, default=3,
+                        help="Depth of U-Net style architecture")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate")
+    parser.add_argument("--finetune_epochs", default=250, type=int,
+                        help="Number of training epochs")
+    parser.add_argument("--output_dir", type=str, default="./output/final_report/",
+                        help="Output directory")
+    parser.add_argument("--amp", action="store_true",
+                        help="Enable automatic mixed precision training")
+    parser.add_argument("--seed", type=int, default=3407,
+                        help="Random seed for reproducibility")
+    parser.add_argument("--patience", type=int, default=30,
+                        help="Early stopping patience")
+    parser.add_argument("--use_tta", action="store_true", default=False,
+                        help="Use test time augmentation")
+    parser.add_argument("--pca_components", type=int, default=30,
+                        help="Number of PCA components")
+    args = parser.parse_args()
+
+    # 设置随机种子
+    seed_everything(args.seed)
+    
+    # 设置输出目录和日志
+    args.output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(args.output_dir, exist_ok=True)
+    logger, run_id = setup_logger(args.output_dir)
+    
+    # 创建时间追踪器
+    tracker = TimeTracker()
+    
+    # 设备配置
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    logger.info(f"Random seed: {args.seed}")
+    logger.info(f"Arguments: {vars(args)}")
+
+    # ===========================================================================
+    # 数据加载
+    # ===========================================================================
+    logger.info(f"Loading dataset: {args. dataset}")
+    
+    if args.dataset == "IP":
+        data_hsi = sio.loadmat(
+            os.path.join(args.dataset_dir, "indian/Indian_pines_corrected.mat")
+        )["indian_pines_corrected"]
+        data_gt = sio.loadmat(
+            os.path.join(args.dataset_dir, "indian/Indian_pines_gt.mat")
+        )["indian_pines_gt"]
+    elif args.dataset == "PU": 
+        data_hsi = sio.loadmat(
+            os.path.join(args.dataset_dir, "PaviaU/PaviaU.mat")
+        )["paviaU"]
+        data_gt = sio.loadmat(
+            os.path.join(args.dataset_dir, "PaviaU/PaviaU_gt.mat")
+        )["paviaU_gt"]
+    elif args.dataset == "SA": 
+        data_hsi = sio.loadmat(
+            os.path.join(args.dataset_dir, "Salinas/Salinas_corrected.mat")
+        )["salinas_corrected"]
+        data_gt = sio. loadmat(
+            os.path.join(args.dataset_dir, "Salinas/Salinas_gt.mat")
+        )["salinas_gt"]
+    
+    line, sample, band = data_hsi.shape
+    class_num = int(np.max(data_gt))
+    gt = data_gt. reshape(line * sample,)
+    
+    logger.info(f"Image shape: {line} x {sample} x {band}")
+    logger.info(f"Number of classes: {class_num}")
+    
+    # PCA降维
+    bands = args.pca_components
+    Xpca = data_hsi.reshape(-1, band)
+    Xpca = PCA(n_components=bands, whiten=False).fit_transform(Xpca)
+    Xpca = Xpca.reshape(line, sample, bands)
+    args.bands = bands
+    args.class_num = class_num
+
+    # ===========================================================================
+    # SLIC超像素分割
+    # ===========================================================================
+    tracker.start("segment")
+    logger.info("Generating hierarchical superpixel segmentation...")
+    
+    SM = SegmentMap(Xpca, args. Unet_depth, random_seed=args.seed)
+    segments, A_list, H_list = SM.getHierarchy()
+    
+    A_list_gpu = [
+        torch.from_numpy(np.array(A, dtype=np.float32)).to(device)
+        for A in A_list
+    ]
+    H_list_gpu = [
+        torch.from_numpy(np.array(H, dtype=np.float32)).to(device)
+        for H in H_list
+    ]
+    tracker.stop("segment")
+    logger.info(f"Segmentation completed in {tracker.get_duration('segment'):.2f}s")
+
+    # ===========================================================================
+    # 数据集划分
+    # ===========================================================================
+    logger.info("Splitting dataset...")
+    train_gt, val_gt, test_gt = sampling_fixed(
+        args.train, args. val, gt, random_seed=args.seed
+    )
+    
+    train_mask = get_label_mask(line, sample, class_num, train_gt)
+    val_mask = get_label_mask(line, sample, class_num, val_gt)
+    test_mask = get_label_mask(line, sample, class_num, test_gt)
+    
+    # 统计各集合样本数
+    train_samples = np.sum(train_mask)
+    val_samples = np.sum(val_mask)
+    test_samples = np.sum(test_mask)
+    
+    logger.info(f"Training samples: {train_samples}")
+    logger.info(f"Validation samples: {val_samples}")
+    logger.info(f"Test samples: {test_samples}")
+
+    # 转换为Tensor
+    train_gt_t = torch.from_numpy(train_gt. astype(np.int64)).to(device)
+    val_gt_t = torch. from_numpy(val_gt. astype(np.int64)).to(device)
+    test_gt_t = torch.from_numpy(test_gt.astype(np.int64)).to(device)
+    train_mask_t = torch.from_numpy(train_mask).to(device)
+    val_mask_t = torch.from_numpy(val_mask).to(device)
+    test_mask_t = torch.from_numpy(test_mask).to(device)
+    net_input = torch.from_numpy(Xpca. astype(np.float32)).to(device)
+
+    # ===========================================================================
+    # 模型初始化
+    # ===========================================================================
+    logger.info("Initializing model...")
+    model = GCNASnet_Final(args, H_list_gpu, A_list_gpu).to(device)
+    num_params = count_parameters(model)
+    logger.info(f"Total trainable parameters: {num_params: ,} ({num_params / 1e6:.4f}M)")
+    
+    # 优化器和调度器
+    optimizer = torch. optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.finetune_epochs, eta_min=1e-6
+    )
+    scaler = amp.GradScaler(enabled=args.amp)
+    
+    # 损失函数
+    focal = ClassBalancedFocalLoss. from_labels(
+        class_num, train_gt, gamma=2.0, device=device
+    )
+    
+    # 早停机制（已关闭）
+    early_stopping = None
+    
+    # 保存配置
+    config_path = save_config(args, args.output_dir, run_id, num_params, {
+        'train_samples': int(train_samples),
+        'val_samples': int(val_samples),
+        'test_samples': int(test_samples),
+        'image_shape': [line, sample, band]
+    })
+    logger.info(f"Configuration saved to:  {config_path}")
+
+    # ===========================================================================
+    # 训练循环
+    # ===========================================================================
+    logger.info("Starting training...")
+    tracker.start("train")
+    
+    best_val_oa = 0.0
+    train_losses = []
+    val_oas = []
+    
+    for epoch in range(args.finetune_epochs):
+        model.train()
+        
+        # 辅助损失权重：余弦衰减
+        aux_w = 0.1 + 0.5 * (1 + math.cos(math.pi * epoch / args.finetune_epochs)) / 2
+
+        optimizer.zero_grad()
+        
+        with amp.autocast(enabled=args. amp):
+            logits_main, logits_aux = model(net_input)
+            targets = train_gt_t.long() - 1
+            loss_m = focal(logits_main, targets, train_mask_t)
+            loss_a = focal(logits_aux, targets, train_mask_t)
+            loss = loss_m + aux_w * loss_a
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        train_losses.append(loss.item())
+
+        # 验证
+        model.eval()
+        with torch.no_grad():
+            logits_v, _ = model(net_input)
+            pred = torch.argmax(logits_v, dim=-1)
+            correct = (pred[val_mask_t] == (val_gt_t[val_mask_t] - 1)).float().mean()
+            val_oa = correct.item()
+        
+        val_oas.append(val_oa)
+        
+        # 保存最佳模型（不使用早停）
+        if val_oa > best_val_oa:
+            best_val_oa = val_oa
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
+        
+        scheduler.step()
+        
+        # 日志输出
+        if (epoch + 1) % 10 == 0:
+            logger.info(
+                f"Epoch {epoch + 1}/{args.finetune_epochs}:  "
+                f"Loss={loss.item():.4f}, AuxW={aux_w:.3f}, "
+                f"ValOA={val_oa:.4f}, BestOA={best_val_oa:.4f}"
+            )
+        
+        # 早停检查已关闭
+        pass
+    
+    tracker.stop("train")
+    logger.info(f"Training completed in {tracker.get_duration('train'):.2f}s")
+
+    # ===========================================================================
+    # 测试
+    # ===========================================================================
+    logger.info("Loading best model and evaluating on test set...")
+    tracker.start("test")
+    
+    model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt")))
+    model.eval()
+    
+    if args.use_tta:
+        logger.info("Using Test Time Augmentation (TTA)...")
+        logits_final = apply_tta(model, net_input, line, sample, class_num)
+    else:
+        with torch.no_grad():
+            logits_final, _ = model(net_input)
+    
+    tracker.stop("test")
+    
+    # 获取预测结果
+    pred = torch.argmax(logits_final, dim=-1).cpu().numpy() + 1
+    pred = pred.reshape(line, sample)
+    pred[data_gt == 0] = 0
+    
+    # 只在测试集上评估（修复测试集泄露问题）
+    pred_flat = pred.reshape(-1)
+    res = pred_flat[test_mask]
+    truth = gt[test_mask]
+    
+    # 计算指标
+    metrics = calculate_metrics(res, truth, class_num)
+    
+    # 绘制结果
+    plot_results(pred, data_gt, class_num, args.output_dir, run_id, metrics['OA'])
+
+    # ===========================================================================
+    # 最终报告
+    # ===========================================================================
+    logger.info("\n")
+    logger.info("=" * 60)
+    logger.info(f"           EXPERIMENT RESULTS ({args.dataset})            ")
+    logger.info("=" * 60)
+    logger.info(f"{'Metric':<20} | {'Value':<15}")
+    logger.info("-" * 40)
+    logger.info(f"{'Overall Accuracy':<20} | {metrics['OA'] * 100:.2f}%")
+    logger.info(f"{'Average Accuracy':<20} | {metrics['AA'] * 100:.2f}%")
+    logger.info(f"{'Kappa Coefficient':<20} | {metrics['Kappa'] * 100:.2f}")
+    logger.info("-" * 40)
+    logger.info(f"{'Train Time':<20} | {tracker. get_duration('train'):.4f} s")
+    logger.info(f"{'Test Time':<20} | {tracker.get_duration('test'):.4f} s")
+    logger.info(f"{'Segment Time':<20} | {tracker.get_duration('segment'):.4f} s")
+    logger.info("-" * 40)
+    logger.info(f"{'Total Params':<20} | {num_params / 1e6:.4f} M")
+    logger.info(f"{'Train Samples':<20} | {train_samples}")
+    logger.info(f"{'Val Samples':<20} | {val_samples}")
+    logger.info(f"{'Test Samples': <20} | {test_samples}")
+    logger.info(f"{'Best Val Epoch':<20} | {int(np.argmax(val_oas)) + 1 if val_oas else 0}")
+    logger.info(f"{'TTA Enabled':<20} | {args.use_tta}")
+    logger.info("=" * 60)
+
+    logger.info("\nClassification Report (precision/recall/f1/support):")
+    logger.info("\n" + metrics['classification_report'])
+    
+    logger.info("\nPer-Class Accuracy:")
+    for i, acc in enumerate(metrics['per_class_acc']):
+        logger.info(f"  Class {i + 1:02d}: {acc * 100:.2f}%")
+    logger.info("=" * 60)
+    
+    # 保存训练曲线
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(train_losses)
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training Loss')
+    axes[0].grid(True)
+    
+    axes[1].plot(val_oas)
+    axes[1].axhline(y=best_val_oa, color='r', linestyle='--', label=f'Best:  {best_val_oa:.4f}')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Validation OA')
+    axes[1].set_title('Validation Accuracy')
+    axes[1].legend()
+    axes[1].grid(True)
+    
+    fig.tight_layout()
+    fig.savefig(os.path.join(args.output_dir, f"training_curve_{run_id}.png"), dpi=250)
+    plt.close(fig)
+    
+    # 保存最终结果
+    results = {
+        'OA': float(metrics['OA']),
+        'AA': float(metrics['AA']),
+        'Kappa': float(metrics['Kappa']),
+        'per_class_acc': metrics['per_class_acc']. tolist(),
+        'train_time': tracker.get_duration('train'),
+        'test_time': tracker.get_duration('test'),
+        'segment_time': tracker.get_duration('segment'),
+        'num_params': num_params,
+        'best_epoch': int(np.argmax(val_oas)) + 1 if val_oas else 0,
+        'total_epochs': len(train_losses)
+    }
+    
+    with open(os.path.join(args.output_dir, f"results_{run_id}.json"), 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    logger.info(f"\nResults saved to: {args.output_dir}")
+    logger.info("Experiment completed successfully!")
+    
+    return results
+
+
+if __name__ == "__main__":
+    main()
